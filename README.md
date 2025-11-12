@@ -21,7 +21,7 @@ The goal of this assignment is to use consensus to build a fault-tolerant replic
 
 3. Completion of [consensus and RSM tutorials (Part 1)](https://bitbucket.org/distrsys/consensus-rsm-tutorials/src/master/README.md?mode=edit&at=master).
 
-You are already familiar with the application environment and background here having completed prerequisite #2 above. Sample solutions for PA2 if you need them are provided in files starting with AVDB* and can be tested by setting `STUDENT_TESTING_MODE` (or `GRADING_MODE` in the PA2 repo) to false.
+You are already familiar with the application environment and background here having completed prerequisite #2 above. 
 
 The goal in this assignment is to make your previous replicated, linearizable consistent, non-fault-tolerant datastore fault-tolerant now using at least two of the three options listed in Goal above.
 
