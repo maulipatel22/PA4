@@ -1,121 +1,174 @@
 package server.faulttolerance;
 
-import edu.umass.cs.nio.interfaces.NodeConfig;
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.Session;
 import edu.umass.cs.nio.nioutils.NIOHeader;
 import edu.umass.cs.nio.nioutils.NodeConfigUtils;
 import edu.umass.cs.utils.Util;
+import org.apache.zookeeper.*;
+import org.apache.zookeeper.data.Stat;
+import edu.umass.cs.nio.nioutils.ServerMessenger;
+
 import server.AVDBReplicatedServer;
 import server.ReplicatedServer;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.logging.Level;
 
-/**
- * This class should implement your replicated fault-tolerant database server if
- * you wish to use Zookeeper or other custom consensus protocols to order client
- * requests.
- * <p>
- * Refer to {@link server.ReplicatedServer} for a starting point for how to do
- * server-server messaging or to {@link server.AVDBReplicatedServer} for a
- * non-fault-tolerant replicated server.
- * <p>
- * You can assume that a single *fault-tolerant* Zookeeper server at the default
- * host:port of localhost:2181 and you can use this service as you please in the
- * implementation of this class.
- * <p>
- * Make sure that both a single instance of Cassandra and a single Zookeeper
- * server are running on their default ports before testing.
- * <p>
- * You can not store in-memory information about request logs for more than
- * {@link #MAX_LOG_SIZE} requests.
- */
-public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
+public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer implements Watcher {
 
-	/**
-	 * Set this value to as small a value with which you can get tests to still
-	 * pass. The lower it is, the faster your implementation is. Grader* will
-	 * use this value provided it is no greater than its MAX_SLEEP limit.
-	 */
-	public static final int SLEEP = 1000;
+    public static final int SLEEP = 1000;
+    public static final boolean DROP_TABLES_AFTER_TESTS = true;
+    public static final int MAX_LOG_SIZE = 400;
+    public static final int DEFAULT_PORT = 2181;
 
-	/**
-	 * Set this to true if you want all tables drpped at the end of each run
-	 * of tests by GraderFaultTolerance.
-	 */
-	public static final boolean DROP_TABLES_AFTER_TESTS=true;
+    private final String myID;
+    private final Session session;
+    private final Cluster cluster;
+    private ServerMessenger serverMessenger;
 
-	/**
-	 * Maximum permitted size of any collection that is used to maintain
-	 * request-specific state, i.e., you can not maintain state for more than
-	 * MAX_LOG_SIZE requests (in memory or on disk). This constraint exists to
-	 * ensure that your logs don't grow unbounded, which forces
-	 * checkpointing to
-	 * be implemented.
-	 */
-	public static final int MAX_LOG_SIZE = 400;
+    private ZooKeeper zk;
+    private final String zkBase = "/seq";
+    private final Map<String, String> pendingOps = Collections.synchronizedMap(new TreeMap<>()); // ordered by op name
+    private String lastAppliedOp = null;
 
-	public static final int DEFAULT_PORT = 2181;
+    public MyDBFaultTolerantServerZK(edu.umass.cs.nio.interfaces.NodeConfig<String> nodeConfig, String myID, InetSocketAddress isaDB) throws IOException {
+        super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
+                nodeConfig.getNodePort(myID) - ReplicatedServer.SERVER_PORT_OFFSET), isaDB, myID);
+        this.myID = myID;
 
-	/**
-	 * @param nodeConfig Server name/address configuration information read
-	 *                      from
-	 *                   conf/servers.properties.
-	 * @param myID       The name of the keyspace to connect to, also the name
-	 *                   of the server itself. You can not connect to any other
-	 *                   keyspace if using Zookeeper.
-	 * @param isaDB      The socket address of the backend datastore to which
-	 *                   you need to establish a session.
-	 * @throws IOException
-	 */
-	public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String
-			myID, InetSocketAddress isaDB) throws IOException {
-		super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
-				nodeConfig.getNodePort(myID) - ReplicatedServer
-						.SERVER_PORT_OFFSET), isaDB, myID);
+        this.cluster = Cluster.builder().addContactPoint("127.0.0.1").build();
+        this.session = this.cluster.connect(myID);
 
-		// TODO: Make sure to do any needed crash recovery here.
-	}
+        try {
+            final CountDownLatch connectedSignal = new CountDownLatch(1);
+            this.zk = new ZooKeeper("localhost:" + DEFAULT_PORT, 3000, event -> {
+                if (event.getState() == Event.KeeperState.SyncConnected) connectedSignal.countDown();
+            });
+            connectedSignal.await();
 
-	/**
-	 * TODO: process bytes received from clients here.
-	 */
-	protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
-		throw new RuntimeException("Not implemented");
-	}
+            Stat s = zk.exists(zkBase, false);
+            if (s == null) {
+                zk.create(zkBase, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            }
 
-	/**
-	 * TODO: process bytes received from fellow servers here.
-	 */
-	protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
-		throw new RuntimeException("Not implemented");
-	}
+            List<String> children = zk.getChildren(zkBase, false);
+            Collections.sort(children);
+            for (String child : children) {
+                String full = zkBase + "/" + child;
+                byte[] data = zk.getData(full, false, null);
+                String cmd = new String(data, StandardCharsets.UTF_8);
+                pendingOps.put(child, cmd);
+            }
+            applyPendingOps(); 
+
+        } catch (Exception e) {
+            throw new IOException("Failed to initialize ZooKeeper client: " + e);
+        }
+
+        log.log(Level.INFO, "ZK-based server {0} started and connected to cassandra keyspace {1}", new Object[]{this.myID, myID});
+    }
+    @Override
+    protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
+        String request = new String(bytes, StandardCharsets.UTF_8);
+        log.info(this.myID + " received client request: " + request + " from " + header.sndr);
+        try {
+            String created = zk.create(zkBase + "/op-", request.getBytes(StandardCharsets.UTF_8),
+                    ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
+
+            String nodeName = created.substring(zkBase.length() + 1);
+
+            pendingOps.put(nodeName, request);
+
+            String payload = nodeName + ":" + Base64.getEncoder().encodeToString(request.getBytes(StandardCharsets.UTF_8));
+            for (String node : this.serverMessenger.getNodeConfig().getNodeIDs()) {
+                try {
+                    this.serverMessenger.send(node, payload.getBytes(StandardCharsets.UTF_8));
+                } catch (IOException ioe) {
+                    log.warning("Failed to send op to " + node + " : " + ioe);
+                }
+            }
+
+            applyPendingOps();
+
+        } catch (KeeperException | InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+    protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
+        String msg = new String(bytes, StandardCharsets.UTF_8);
+        log.info(this.myID + " received server message from " + header.sndr + " : " + msg);
+        try {
+            int idx = msg.indexOf(':');
+            if (idx < 0) {
+                log.warning("Malformed server message: " + msg);
+                return;
+            }
+            String nodeName = msg.substring(0, idx);
+            String b64 = msg.substring(idx + 1);
+            String payload = new String(Base64.getDecoder().decode(b64), StandardCharsets.UTF_8);
+
+            pendingOps.put(nodeName, payload);
+
+            applyPendingOps();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void applyPendingOps() {
+        synchronized (pendingOps) {
+            List<String> keys = new ArrayList<>(pendingOps.keySet());
+            Collections.sort(keys);
+            for (String nodeName : keys) {
+                if (lastAppliedOp == null || nodeName.compareTo(lastAppliedOp) > 0) {
+                    String cmd = pendingOps.get(nodeName);
+                    try {
+                        if (cmd != null && !cmd.trim().isEmpty()) {
+                            session.execute(cmd);
+                        }
+                        lastAppliedOp = nodeName;
+                        pendingOps.remove(nodeName);
+                        if (pendingOps.size() > MAX_LOG_SIZE) {
+                            ArrayList<String> keep = new ArrayList<>(pendingOps.keySet());
+                            Collections.sort(keep);
+                            int removeCount = keep.size() - MAX_LOG_SIZE;
+                            for (int i = 0; i < removeCount; i++) {
+                                pendingOps.remove(keep.get(i));
+                            }
+                        }
+                    } catch (Exception e) {
+                        log.log(Level.SEVERE, "Failed to apply op " + nodeName + " command:" + cmd, e);
+                    }
+                }
+            }
+        }
+    }
 
 
-	/**
-	 * TODO: Gracefully close any threads or messengers you created.
-	 */
-	public void close() {
-		throw new RuntimeException("Not implemented");
-	}
+    public void close() {
+        super.close();
+        this.serverMessenger.stop();
+        try {
+            if (zk != null) zk.close();
+        } catch (InterruptedException e) {
+        }
+        if (session != null) session.close();
+        if (cluster != null) cluster.close();
+    }
 
-	public static enum CheckpointRecovery {
-		CHECKPOINT, RESTORE;
-	}
-
-	/**
-	 * @param args args[0] must be server.properties file and args[1] must be
-	 *             myID. The server prefix in the properties file must be
-	 *             ReplicatedServer.SERVER_PREFIX. Optional args[2] if
-	 *             specified
-	 *             will be a socket address for the backend datastore.
-	 * @throws IOException
-	 */
-	public static void main(String[] args) throws IOException {
-		new MyDBFaultTolerantServerZK(NodeConfigUtils.getNodeConfigFromFile
-				(args[0], ReplicatedServer.SERVER_PREFIX, ReplicatedServer
-						.SERVER_PORT_OFFSET), args[1], args.length > 2 ? Util
-				.getInetSocketAddressFromString(args[2]) : new
-				InetSocketAddress("localhost", 9042));
-	}
+    @Override
+    public void process(WatchedEvent event) {
+    }
+    public static void main(String[] args) throws IOException {
+        new MyDBFaultTolerantServerZK(NodeConfigUtils.getNodeConfigFromFile
+                (args[0], ReplicatedServer.SERVER_PREFIX, ReplicatedServer.SERVER_PORT_OFFSET), args[1],
+                args.length > 2 ? Util.getInetSocketAddressFromString(args[2]) : new InetSocketAddress("localhost", 9042));
+    }
 
 }
