@@ -1,84 +1,173 @@
-package server;
+package server.faulttolerance;
 
-import edu.umass.cs.nio.AbstractBytePacketDemultiplexer;
-import edu.umass.cs.nio.MessageNIOTransport;
+import edu.umass.cs.nio.interfaces.NodeConfig;
 import edu.umass.cs.nio.nioutils.NIOHeader;
+import edu.umass.cs.nio.nioutils.NodeConfigUtils;
 import edu.umass.cs.utils.Util;
+import org.apache.zookeeper.*;
+import org.apache.zookeeper.data.Stat;
+import com.datastax.oss.driver.api.core.cql.*;
+
+import server.MyDBSingleServer;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-/**
- * @author arun
- * <p>
- * <p>
- * This class implements a simple echo server using non-blocking IO.
- * <p>
- * Starting points for student code are methods marked TODO.
- */
-public class SingleServer {
-	public static final int DEFAULT_PORT = 2000;
-	public static final String DEFAULT_ENCODING = "ISO-8859-1";
 
-	protected static final Logger log = Logger.getLogger(SingleServer.class
-			.getName());
-	protected final MessageNIOTransport<String, String> clientMessenger;
+public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
 
-	/**
-	 * @param isa      Client-facing socket address
-	 * @param isaDB    Socket address of the backend data store
-	 * @param keyspace Keyspace in the backend data store
-	 * @throws IOException
-	 */
-	public SingleServer(InetSocketAddress isa, InetSocketAddress isaDB, String
-			keyspace) throws IOException {
-		this.clientMessenger = new MessageNIOTransport<String, String>(isa
-				.getAddress(), isa.getPort(), new
-				AbstractBytePacketDemultiplexer() {
-			@Override
-			public boolean handleMessage(byte[] bytes, NIOHeader nioHeader) {
-				handleMessageFromClient(bytes, nioHeader);
-				return true;
-			}
-		});
-		log.log(Level.INFO, "{0} started client messenger at {1}", new
-				Object[]{this, isa});
-	}
+    private static final Logger log = Logger.getLogger(MyDBFaultTolerantServerZK.class.getName());
 
-	// TODO: process bytes received from clients here
-	protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
-		// simple echo server
-		try {
-			log.log(Level.INFO, "{0} received message from {1}", new
-					Object[]{this.clientMessenger.getListeningSocketAddress(),
-					header.sndr});
-			this.clientMessenger.send(header.sndr, bytes);
-		} catch (IOException e) {
-			e.printStackTrace();
-		}
-	}
+    public static final int MAX_LOG_SIZE = 400;
+    public static final int DEFAULT_PORT = 2181;
 
-	/**
-	 * @param args The first argument must be of the form [host:]port with an
-	 *             optional host name or IP.
-	 */
-	public static InetSocketAddress getSocketAddress(String[] args) {
-		return args.length > 0 && args[0].contains(":") ? Util
-				.getInetSocketAddressFromString(args[0]) : new
-				InetSocketAddress("localhost", args.length > 0 ? Integer
-				.parseInt(args[0].replaceAll(".*:", "")) : DEFAULT_PORT);
-	}
+    private final String myID;
+    private final NodeConfig<String> nodeConfig;
+    private ZooKeeper zk;
+    private final LinkedList<String> requestLog = new LinkedList<>();
 
-	public void close() {
-		this.clientMessenger.stop();
-	}
+    private static final String REQUESTS_PATH = "/requests";
+    private static final String CHECKPOINT_TABLE = "checkpoint";
 
-	public static void main(String[] args) throws IOException {
-		new SingleServer(getSocketAddress(args), new InetSocketAddress
-				("localhost", 9042), "demo");
-	}
+    public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID,
+                                     InetSocketAddress isaDB) throws IOException, KeeperException, InterruptedException {
+        super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
+                nodeConfig.getNodePort(myID)), isaDB, myID);
 
-	;
+        this.myID = myID;
+        this.nodeConfig = nodeConfig;
+
+        connectToZookeeper();
+        ensureZNodeExists(REQUESTS_PATH);
+
+        recoverFromCheckpoint();
+        replayPendingRequests();
+    }
+
+    private void connectToZookeeper() throws IOException, InterruptedException {
+        CountDownLatch connectedSignal = new CountDownLatch(1);
+        this.zk = new ZooKeeper("localhost:" + DEFAULT_PORT, 3000, event -> {
+            if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                connectedSignal.countDown();
+            }
+        });
+        connectedSignal.await();
+        log.info("Connected to Zookeeper");
+    }
+
+    private void ensureZNodeExists(String path) throws KeeperException, InterruptedException {
+        Stat stat = zk.exists(path, false);
+        if (stat == null) {
+            zk.create(path, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        }
+    }
+
+    @Override
+    public void process(WatchedEvent event) {
+    }
+
+    private void recoverFromCheckpoint() {
+        try {
+            session.execute("CREATE TABLE IF NOT EXISTS " + CHECKPOINT_TABLE +
+                    " (server_id text PRIMARY KEY, executed list<text>)");
+            ResultSet rs = session.execute("SELECT executed FROM " + CHECKPOINT_TABLE +
+                    " WHERE server_id='" + myID + "';");
+            Row row = rs.one();
+            if (row != null) {
+                List<String> executed = row.getList("executed", String.class);
+                requestLog.addAll(executed);
+            }
+            log.info("Recovered " + requestLog.size() + " requests from checkpoint");
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Error recovering checkpoint", e);
+        }
+    }
+
+    private void replayPendingRequests() {
+        try {
+            List<String> children = zk.getChildren(REQUESTS_PATH, false);
+            Collections.sort(children); 
+            for (String node : children) {
+                byte[] data = zk.getData(REQUESTS_PATH + "/" + node, false, null);
+                String request = new String(data, StandardCharsets.UTF_8);
+                synchronized (requestLog) {
+                    if (!requestLog.contains(request)) {
+                        session.execute(request);
+                        requestLog.add(request);
+                        truncateLogIfNeeded();
+                    }
+                }
+            }
+            persistCheckpoint();
+            log.info("Replayed pending requests from Zookeeper");
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Error replaying Zookeeper requests", e);
+        }
+    }
+
+    @Override
+    protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
+        try {
+            String request = new String(bytes, StandardCharsets.UTF_8);
+
+            zk.create(REQUESTS_PATH + "/req_", request.getBytes(StandardCharsets.UTF_8),
+                    ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
+
+            session.execute(request);
+            synchronized (requestLog) {
+                requestLog.add(request);
+                truncateLogIfNeeded();
+            }
+
+            persistCheckpoint();
+
+            clientMessenger.send(header.sndr, "OK".getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Error handling client request", e);
+        }
+    }
+
+    private void truncateLogIfNeeded() {
+        while (requestLog.size() > MAX_LOG_SIZE) {
+            requestLog.removeFirst();
+        }
+    }
+
+    private void persistCheckpoint() {
+        try {
+            session.execute("INSERT INTO " + CHECKPOINT_TABLE + " (server_id, executed) VALUES ('" +
+                    myID + "', ?)", requestLog);
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Error persisting checkpoint", e);
+        }
+    }
+
+    @Override
+    protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
+    }
+
+    @Override
+    public void close() {
+        try {
+            if (zk != null) zk.close();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        super.close();
+    }
+
+    public static void main(String[] args) throws Exception {
+        NodeConfig<String> nodeConfig = NodeConfigUtils.getNodeConfigFromFile(
+                args[0], "server", 0);
+        String myID = args[1];
+        InetSocketAddress isaDB = args.length > 2 ? Util.getInetSocketAddressFromString(args[2])
+                : new InetSocketAddress("localhost", 9042);
+
+        new MyDBFaultTolerantServerZK(nodeConfig, myID, isaDB);
+    }
 }
