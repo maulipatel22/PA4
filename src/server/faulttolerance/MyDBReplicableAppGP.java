@@ -2,6 +2,7 @@ package server.faulttolerance;
 
 import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
 import edu.umass.cs.gigapaxos.interfaces.Replicable;
 import edu.umass.cs.gigapaxos.interfaces.Request;
@@ -14,7 +15,6 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.Set;
 
-
 public class MyDBReplicableAppGP implements Replicable {
 
     public static final int SLEEP = 1000;
@@ -23,15 +23,8 @@ public class MyDBReplicableAppGP implements Replicable {
     private Cluster cluster;
     private Session session;
     private String keyspace;
-
     private final Deque<String> executedRequests = new ArrayDeque<>();
 
-    /**
-     * Constructor used by GigaPaxos reflection.
-     *
-     * @param args args[0] = keyspace name
-     * @throws IOException
-     */
     public MyDBReplicableAppGP(String[] args) throws IOException {
         if (args == null || args.length == 0)
             throw new IllegalArgumentException("Missing keyspace argument");
@@ -43,7 +36,6 @@ public class MyDBReplicableAppGP implements Replicable {
 
         session.execute("CREATE KEYSPACE IF NOT EXISTS " + keyspace +
                 " WITH replication = {'class': 'SimpleStrategy', 'replication_factor':1};");
-
         session.execute("USE " + keyspace + ";");
 
         session.execute("CREATE TABLE IF NOT EXISTS default_table (" +
@@ -63,7 +55,7 @@ public class MyDBReplicableAppGP implements Replicable {
         }
 
         RequestPacket rp = (RequestPacket) request;
-        String command = rp.getCommand();
+        String command = rp.getRequestValue().toString();
 
         synchronized (executedRequests) {
             if (executedRequests.size() >= MAX_LOG_SIZE) {
@@ -108,14 +100,12 @@ public class MyDBReplicableAppGP implements Replicable {
         return sb.toString();
     }
 
-    
     @Override
     public boolean restore(String s, String s1) {
         session.execute("TRUNCATE default_table;");
 
         synchronized (executedRequests) {
             executedRequests.clear();
-
             if (s1 != null && !s1.isEmpty()) {
                 String[] commands = s1.split("\n");
                 for (String cmd : commands) {
@@ -128,7 +118,6 @@ public class MyDBReplicableAppGP implements Replicable {
 
         return true;
     }
-
 
     @Override
     public Request getRequest(String s) throws RequestParseException {
