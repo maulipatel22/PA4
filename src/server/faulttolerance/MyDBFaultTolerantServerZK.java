@@ -18,9 +18,6 @@ import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 
-/**
- * Zookeeper-based fault-tolerant server.
- */
 public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
 
     public static final int SLEEP = 1000;
@@ -44,7 +41,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
         this.myID = myID;
 
-        // Connect to Cassandra keyspace
         this.cluster = Cluster.builder().addContactPoint("127.0.0.1").build();
         this.session = this.cluster.connect(myID);
 
@@ -57,13 +53,14 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
             connectedSignal.await();
 
-            // Ensure base path exists
-            Stat s = zk.exists(zkBase, false);
-            if (s == null) {
-                zk.create(zkBase, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            try {
+                Stat s = zk.exists(zkBase, false);
+                if (s == null) {
+                    zk.create(zkBase, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                }
+            } catch (KeeperException.NodeExistsException ignored) {
             }
 
-            // Load existing ops
             List<String> children = zk.getChildren(zkBase, false);
             Collections.sort(children);
             for (String child : children) {
@@ -73,7 +70,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 pendingOps.put(child, cmd);
             }
 
-            // Apply any pending ops
             applyPendingOps();
 
         } catch (Exception e) {
@@ -89,14 +85,12 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         log.info(this.myID + " received client request: " + request + " from " + header.sndr);
 
         try {
-            // Write sequential op to Zookeeper
             String created = zk.create(zkBase + "/op-", request.getBytes(StandardCharsets.UTF_8),
                     ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
 
             String nodeName = created.substring(zkBase.length() + 1);
             pendingOps.put(nodeName, request);
 
-            // Apply ops locally
             applyPendingOps();
 
         } catch (KeeperException | InterruptedException e) {
@@ -118,7 +112,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                         lastAppliedOp = nodeName;
                         pendingOps.remove(nodeName);
 
-                        // Maintain MAX_LOG_SIZE
                         if (pendingOps.size() > MAX_LOG_SIZE) {
                             List<String> keep = new ArrayList<>(pendingOps.keySet());
                             Collections.sort(keep);
@@ -138,7 +131,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
     @Override
     public void process(WatchedEvent event) {
-        // No-op; used to satisfy Watcher interface
     }
 
     @Override
