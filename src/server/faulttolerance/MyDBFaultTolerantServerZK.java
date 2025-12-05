@@ -2,177 +2,197 @@ package server.faulttolerance;
 
 import edu.umass.cs.nio.interfaces.NodeConfig;
 import edu.umass.cs.nio.nioutils.NIOHeader;
-import server.AVDBReplicatedServer;
+import edu.umass.cs.nio.nioutils.NodeConfigUtils;
+import edu.umass.cs.utils.Util;
+import server.MyDBSingleServer;
 import server.ReplicatedServer;
 
-import org.apache.zookeeper.*;
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.Session;
+
+import edu.umass.cs.nio.AbstractBytePacketDemultiplexer;
+import edu.umass.cs.nio.MessageNIOTransport;
+
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.logging.Level;
 
 
-public class MyDBFaultTolerantServerZK extends AVDBReplicatedServer implements Watcher {
+public class MyDBFaultTolerantServerZK extends MyDBSingleServer {
 
     public static final int SLEEP = 1000;
     public static final boolean DROP_TABLES_AFTER_TESTS = true;
     public static final int MAX_LOG_SIZE = 400;
+    public static final int DEFAULT_PORT = 2181;
 
-    private static final String ZK_ROOT = "/replicated_db";
-    private static final String ZK_LEADER = ZK_ROOT + "/leader";
-    private static final int SESSION_TIMEOUT = 5000;
+    protected final MessageNIOTransport<String, String> serverMessenger;
+    protected final String myID;
+    protected final String leader;
 
-    private ZooKeeper zk;
-    private boolean isLeader = false;
-    private String myID;
+    private final Cluster cluster;
+    private final Session session;
 
-    private final ConcurrentHashMap<Long, JSONObject> requestQueue = new ConcurrentHashMap<>();
-    private long nextRequestId = 0;
-    private long expectedId = 0;
-
+    private final ConcurrentHashMap<Long, JSONObject> queue = new ConcurrentHashMap<>();
     private CopyOnWriteArrayList<String> notAcked;
+    private long reqNum = 0;
+    private long expected = 0;
 
-    public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID, InetSocketAddress isaDB) throws IOException {
-        super(nodeConfig, myID, isaDB); 
+    private synchronized long incrReqNum() { return reqNum++; }
+    private synchronized long incrExpected() { return expected++; }
+
+    public static enum Type {
+        REQUEST, PROPOSAL, ACKNOWLEDGEMENT
+    }
+
+    public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID,
+                                     InetSocketAddress isaDB) throws IOException {
+        super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
+                        nodeConfig.getNodePort(myID) - ReplicatedServer.SERVER_PORT_OFFSET),
+                isaDB, myID);
+
         this.myID = myID;
 
-        try {
-            zk = new ZooKeeper("localhost:2181", SESSION_TIMEOUT, this);
-            if (zk.exists(ZK_ROOT, false) == null) {
-                zk.create(ZK_ROOT, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-            }
-            electLeader();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
+        this.cluster = Cluster.builder().addContactPoint(isaDB.getHostString()).build();
+        this.session = cluster.connect(myID);
 
-    @Override
-    public void process(WatchedEvent event) {
-        if (event.getType() == Event.EventType.NodeDeleted && ZK_LEADER.equals(event.getPath())) {
-            try {
-                electLeader();
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
-    }
+        this.serverMessenger = new MessageNIOTransport<>(myID, nodeConfig,
+                new AbstractBytePacketDemultiplexer() {
+                    @Override
+                    public boolean handleMessage(byte[] bytes, NIOHeader nioHeader) {
+                        handleMessageFromServer(bytes, nioHeader);
+                        return true;
+                    }
+                }, true);
 
-    private void electLeader() throws KeeperException, InterruptedException {
-        try {
-            zk.create(ZK_LEADER, myID.getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
-            isLeader = true;
-            System.out.println(myID + " is elected leader.");
-        } catch (KeeperException.NodeExistsException e) {
-            isLeader = false;
-            zk.exists(ZK_LEADER, true); 
-            System.out.println(myID + " is a follower.");
+        String firstNode = null;
+        for (String node : nodeConfig.getNodeIDs()) {
+            firstNode = node;
+            break;
         }
+        this.leader = firstNode;
+
+        log.log(Level.INFO, "Server {0} started with leader {1}", new Object[]{myID, leader});
     }
 
     @Override
     protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
         String requestStr = new String(bytes);
+        log.log(Level.INFO, "{0} received client request: {1}", new Object[]{myID, requestStr});
 
+        JSONObject packet = new JSONObject();
         try {
-            JSONObject json = new JSONObject();
-            json.put("request", requestStr);
-            json.put("type", "REQUEST");
-
-            serverMessenger.send(getLeaderId(), json.toString().getBytes());
-
-        } catch (Exception e) {
+            packet.put("request", requestStr);
+            packet.put("type", Type.REQUEST.toString());
+            // Forward to leader
+            serverMessenger.send(leader, packet.toString().getBytes());
+        } catch (IOException | JSONException e) {
             e.printStackTrace();
         }
     }
 
     @Override
     protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
+        JSONObject json;
         try {
-            JSONObject json = new JSONObject(new String(bytes));
-            String type = json.getString("type");
+            json = new JSONObject(new String(bytes));
+        } catch (JSONException e) {
+            e.printStackTrace();
+            return;
+        }
 
-            if ("REQUEST".equals(type)) {
-                if (isLeader) {
-                    long reqId = nextRequestId++;
+        String type;
+        try {
+            type = json.getString("type");
+        } catch (JSONException e) {
+            log.severe("Malformed message received: " + json);
+            return;
+        }
+
+        try {
+            if (type.equals(Type.REQUEST.toString())) {
+                if (myID.equals(leader)) {
+                    long reqId = incrReqNum();
                     json.put("reqId", reqId);
-                    json.put("type", "PROPOSAL");
-
-                    requestQueue.put(reqId, json);
-                    broadcastProposal(reqId, json);
+                    queue.put(reqId, json);
+                    sendNextProposalIfReady();
                 }
-            } else if ("PROPOSAL".equals(type)) {
-                executeRequest(json);
-                sendAck(header.sndr, json.getLong("reqId"));
-            } else if ("ACK".equals(type) && isLeader) {
-                processAck(json.getString("sender"), json.getLong("reqId"));
-            }
+            } else if (type.equals(Type.PROPOSAL.toString())) {
+                String query = json.getString("request");
+                long reqId = json.getLong("reqId");
 
-        } catch (Exception e) {
+                session.execute(query);
+
+                String senderId = serverMessenger.getNodeConfig().getNodeID(header.sndr);
+                JSONObject ack = new JSONObject();
+                ack.put("type", Type.ACKNOWLEDGEMENT.toString());
+                ack.put("reqId", reqId);
+                ack.put("node", myID);
+                serverMessenger.send(senderId, ack.toString().getBytes());
+            } else if (type.equals(Type.ACKNOWLEDGEMENT.toString())) {
+                if (myID.equals(leader)) {
+                    String node = json.getString("node");
+                    if (dequeue(node)) {
+                        expected++;
+                        sendNextProposalIfReady();
+                    }
+                }
+            }
+        } catch (JSONException | IOException e) {
             e.printStackTrace();
         }
     }
 
-    private void executeRequest(JSONObject json) throws Exception {
-        String query = json.getString("request");
-        session.execute(query);
+    private boolean isReadyToSend(long expectedId) {
+        return queue.containsKey(expectedId);
     }
 
-    private void sendAck(String leaderId, long reqId) throws IOException {
-        JSONObject ack = new JSONObject();
-        ack.put("type", "ACK");
-        ack.put("reqId", reqId);
-        ack.put("sender", myID);
-        serverMessenger.send(leaderId, ack.toString().getBytes());
+    private void sendNextProposalIfReady() throws IOException, JSONException {
+        if (isReadyToSend(expected)) {
+            JSONObject proposal = queue.remove(expected);
+            if (proposal != null) {
+                proposal.put("type", Type.PROPOSAL.toString());
+                enqueue();
+                broadcastProposal(proposal);
+            }
+        }
     }
 
-    private void broadcastProposal(long reqId, JSONObject proposal) throws IOException {
-        notAcked = new CopyOnWriteArrayList<>(serverMessenger.getNodeConfig().getNodeIDs());
+    private void broadcastProposal(JSONObject proposal) throws IOException {
         for (String node : serverMessenger.getNodeConfig().getNodeIDs()) {
             serverMessenger.send(node, proposal.toString().getBytes());
         }
+        log.log(Level.INFO, "Leader {0} broadcast proposal {1}", new Object[]{myID, proposal});
     }
 
-    private void processAck(String sender, long reqId) {
-        notAcked.remove(sender);
-        if (notAcked.isEmpty()) {
-            requestQueue.remove(reqId);
-        }
+    private void enqueue() {
+        notAcked = new CopyOnWriteArrayList<>();
+        notAcked.addAll(serverMessenger.getNodeConfig().getNodeIDs());
     }
 
-    private String getLeaderId() throws KeeperException, InterruptedException {
-        byte[] data = zk.getData(ZK_LEADER, false, null);
-        return new String(data);
+    private boolean dequeue(String node) {
+        notAcked.remove(node);
+        return notAcked.isEmpty();
     }
 
     @Override
     public void close() {
-        try { zk.close(); } catch (InterruptedException e) { e.printStackTrace(); }
         super.close();
+        serverMessenger.stop();
+        session.close();
+        cluster.close();
     }
 
-    public static void main(String[] args) {
-        try {
-            if (args.length < 2) {
-                System.err.println("Usage: <server.properties> <myID> [DB address]");
-                System.exit(1);
-            }
-
-            InetSocketAddress isaDB = args.length > 2
-                    ? new InetSocketAddress(args[2].split(":")[0], Integer.parseInt(args[2].split(":")[1]))
-                    : new InetSocketAddress("localhost", 9042);
-
-            new MyDBFaultTolerantServerZK(
-                    edu.umass.cs.nio.nioutils.NodeConfigUtils.getNodeConfigFromFile(
-                            args[0], ReplicatedServer.SERVER_PREFIX, ReplicatedServer.SERVER_PORT_OFFSET),
-                    args[1],
-                    isaDB
-            );
-
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+    public static void main(String[] args) throws IOException {
+        NodeConfig<String> config = NodeConfigUtils.getNodeConfigFromFile(args[0],
+                ReplicatedServer.SERVER_PREFIX, ReplicatedServer.SERVER_PORT_OFFSET);
+        String myID = args[1];
+        InetSocketAddress isaDB = args.length > 2 ? Util.getInetSocketAddressFromString(args[2])
+                : new InetSocketAddress("localhost", 9042);
+        new MyDBFaultTolerantServerZK(config, myID, isaDB);
     }
 }
