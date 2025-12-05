@@ -6,8 +6,10 @@ import edu.umass.cs.nio.nioutils.NodeConfigUtils;
 import edu.umass.cs.utils.Util;
 import org.apache.zookeeper.*;
 import org.apache.zookeeper.data.Stat;
-import com.datastax.oss.driver.api.core.cql.*;
-
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
 import server.MyDBSingleServer;
 
 import java.io.IOException;
@@ -18,13 +20,14 @@ import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-
 public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
 
     private static final Logger log = Logger.getLogger(MyDBFaultTolerantServerZK.class.getName());
 
     public static final int MAX_LOG_SIZE = 400;
     public static final int DEFAULT_PORT = 2181;
+    public static final int SLEEP = 1000; 
+    public static final boolean DROP_TABLES_AFTER_TESTS = true; 
 
     private final String myID;
     private final NodeConfig<String> nodeConfig;
@@ -34,6 +37,9 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     private static final String REQUESTS_PATH = "/requests";
     private static final String CHECKPOINT_TABLE = "checkpoint";
 
+    private Cluster cluster;
+    private Session session;
+
     public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID,
                                      InetSocketAddress isaDB) throws IOException, KeeperException, InterruptedException {
         super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
@@ -42,11 +48,22 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         this.myID = myID;
         this.nodeConfig = nodeConfig;
 
+        connectToCassandra(isaDB);
+
         connectToZookeeper();
         ensureZNodeExists(REQUESTS_PATH);
 
         recoverFromCheckpoint();
         replayPendingRequests();
+    }
+
+    private void connectToCassandra(InetSocketAddress isaDB) {
+        cluster = Cluster.builder()
+                .addContactPoint(isaDB.getHostString())
+                .withPort(isaDB.getPort())
+                .build();
+        session = cluster.connect(); 
+        log.info("Connected to Cassandra at " + isaDB);
     }
 
     private void connectToZookeeper() throws IOException, InterruptedException {
@@ -68,8 +85,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     }
 
     @Override
-    public void process(WatchedEvent event) {
-    }
+    public void process(WatchedEvent event) {}
 
     private void recoverFromCheckpoint() {
         try {
@@ -148,8 +164,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     }
 
     @Override
-    protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
-    }
+    protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {}
 
     @Override
     public void close() {
@@ -158,10 +173,12 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
+        if (session != null) session.close();
+        if (cluster != null) cluster.close();
         super.close();
     }
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) throws IOException, KeeperException, InterruptedException {
         NodeConfig<String> nodeConfig = NodeConfigUtils.getNodeConfigFromFile(
                 args[0], "server", 0);
         String myID = args[1];
