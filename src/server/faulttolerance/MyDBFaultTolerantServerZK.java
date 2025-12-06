@@ -248,7 +248,6 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         }
     }
 
-    @Override
     protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
     }
 
