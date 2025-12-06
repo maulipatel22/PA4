@@ -8,7 +8,12 @@ import edu.umass.cs.nio.interfaces.NodeConfig;
 import edu.umass.cs.nio.nioutils.NIOHeader;
 import edu.umass.cs.nio.nioutils.NodeConfigUtils;
 import edu.umass.cs.utils.Util;
-import org.apache.zookeeper.*;
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.data.Stat;
 import server.MyDBSingleServer;
 import server.ReplicatedServer;
@@ -48,18 +53,21 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
     public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig,
                                      String myID,
-                                     InetSocketAddress cassandraAddr) throws IOException {
-        super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
-                nodeConfig.getNodePort(myID)), cassandraAddr, myID);
+                                     InetSocketAddress cassandraAddress) throws IOException {
+        super(
+                new InetSocketAddress(nodeConfig.getNodeAddress(myID), nodeConfig.getNodePort(myID)),
+                cassandraAddress,
+                myID
+        );
         this.nodeConfig = nodeConfig;
         this.myID = myID;
+
         this.cluster = Cluster.builder()
-                .addContactPoint(cassandraAddr.getHostString())
-                .withPort(cassandraAddr.getPort())
+                .addContactPoint(cassandraAddress.getHostString())
+                .withPort(cassandraAddress.getPort())
                 .build();
-        Session tmpSession = cluster.connect();
-        tmpSession.execute("CREATE KEYSPACE IF NOT EXISTS zkft WITH replication = {'class':'SimpleStrategy', 'replication_factor':1};");
-        this.session = cluster.connect("zkft");
+        this.session = cluster.connect(myID);
+
         try {
             connectToZookeeper();
             ensureZNodeExists(REQUESTS_PATH);
@@ -68,7 +76,9 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
             initCheckpointTable();
             loadCheckpoint();
             replayPendingRequests();
-        } catch (IOException | KeeperException | InterruptedException e) {
+            zk.getChildren(REQUESTS_PATH, this);
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Error initializing fault-tolerant server", e);
             throw new IOException(e);
         }
     }
@@ -83,14 +93,13 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     @Override
     public void process(WatchedEvent event) {
         try {
-            if (event.getState() == Event.KeeperState.SyncConnected
-                    && zkConnectedSignal != null) {
+            if (event.getState() == Event.KeeperState.SyncConnected && zkConnectedSignal != null) {
                 zkConnectedSignal.countDown();
             }
-
             if (event.getType() == Event.EventType.NodeChildrenChanged
                     && REQUESTS_PATH.equals(event.getPath())) {
                 replayPendingRequests();
+                zk.getChildren(REQUESTS_PATH, this);
             }
         } catch (Exception e) {
             log.log(Level.SEVERE, "Error in ZooKeeper watcher", e);
@@ -105,7 +114,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 log.info("Created znode " + path + " in ZooKeeper");
             }
         } catch (KeeperException.NodeExistsException e) {
-            log.fine("Znode " + path + " already exists; ignoring NodeExistsException");
+            log.fine("Znode " + path + " already exists");
         }
     }
 
@@ -145,8 +154,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
             Row row = rs.one();
             if (row != null) {
                 this.lastAppliedZnode = row.getString("last_znode");
-                log.info("Loaded checkpoint for " + myID
-                        + " last_znode=" + this.lastAppliedZnode);
+                log.info("Loaded checkpoint for " + myID + " last_znode=" + this.lastAppliedZnode);
             } else {
                 log.info("No existing checkpoint for " + myID + "; starting from scratch");
             }
@@ -168,51 +176,69 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         }
     }
 
+    private void applyRequest(byte[] data) {
+        String request = new String(data, StandardCharsets.UTF_8);
+        try {
+            session.execute(request);
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Error applying request from log: " + request, e);
+        }
+    }
+
     private synchronized void replayPendingRequests() {
         try {
-            List<String> children = zk.getChildren(REQUESTS_PATH, this);
+            List<String> children = zk.getChildren(REQUESTS_PATH, false);
             if (children.isEmpty()) {
-                log.info("No requests in ZK log; nothing to checkpoint");
+                log.info("No requests in ZK log; nothing to replay");
                 return;
             }
 
             Collections.sort(children);
 
-            String latest = children.get(children.size() - 1);
+            int startIndex = 0;
+            if (lastAppliedZnode != null) {
+                int idx = children.indexOf(lastAppliedZnode);
+                if (idx >= 0) {
+                    startIndex = idx + 1;
+                }
+            }
 
-            if (lastAppliedZnode == null || latest.compareTo(lastAppliedZnode) > 0) {
-                lastAppliedZnode = latest;
+            for (int i = startIndex; i < children.size(); i++) {
+                String child = children.get(i);
+                String fullPath = REQUESTS_PATH + "/" + child;
+                byte[] data = zk.getData(fullPath, false, null);
+                applyRequest(data);
+                lastAppliedZnode = child;
+            }
+
+            if (startIndex < children.size()) {
                 persistCheckpoint();
                 log.info("Updated checkpoint; lastAppliedZnode=" + lastAppliedZnode);
             } else {
                 log.fine("Checkpoint already up to date at " + lastAppliedZnode);
             }
         } catch (KeeperException.NoNodeException nne) {
-            log.log(Level.INFO, "No /requests znode yet; nothing to replay/checkpoint");
+            log.log(Level.INFO, "No /requests znode yet; nothing to replay");
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Error updating checkpoint from ZK log", e);
+            log.log(Level.SEVERE, "Error updating from ZK log", e);
         }
     }
 
     @Override
     protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
-        String request = new String(bytes, StandardCharsets.UTF_8);
         try {
             zk.create(
                     REQUESTS_PATH + "/req_",
-                    request.getBytes(StandardCharsets.UTF_8),
+                    bytes,
                     ZooDefs.Ids.OPEN_ACL_UNSAFE,
                     CreateMode.PERSISTENT_SEQUENTIAL
             );
-
             replayPendingRequests();
-
             try {
                 clientMessenger.send(header.sndr, "OK".getBytes(StandardCharsets.UTF_8));
             } catch (IOException e) {
                 log.log(Level.SEVERE, "Error sending response to client", e);
             }
-
         } catch (KeeperException | InterruptedException e) {
             log.log(Level.SEVERE, "Error logging client request in ZooKeeper", e);
         } catch (Exception e) {
