@@ -182,31 +182,26 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     private synchronized void replayPendingRequests() {
         try {
             List<String> children = zk.getChildren(REQUESTS_PATH, this);
-            Collections.sort(children);
-
-            for (String node : children) {
-                if (lastAppliedZnode != null && node.compareTo(lastAppliedZnode) <= 0) {
-                    continue; 
-                }
-                String fullPath = REQUESTS_PATH + "/" + node;
-                byte[] data = zk.getData(fullPath, false, null);
-                String request = new String(data, StandardCharsets.UTF_8);
-
-                try {
-                    session.execute(request);
-                } catch (Exception e) {
-                    log.log(Level.SEVERE, "Error executing replayed request " + request, e);
-                }
-
-                lastAppliedZnode = node;
-                persistCheckpoint();
+            if (children.isEmpty()) {
+                log.info("No requests in ZK log; nothing to checkpoint");
+                return;
             }
 
-            log.info("Replayed pending requests; lastAppliedZnode=" + lastAppliedZnode);
+            Collections.sort(children);
+
+            String latest = children.get(children.size() - 1);
+
+            if (lastAppliedZnode == null || latest.compareTo(lastAppliedZnode) > 0) {
+                lastAppliedZnode = latest;
+                persistCheckpoint();
+                log.info("Updated checkpoint; lastAppliedZnode=" + lastAppliedZnode);
+            } else {
+                log.fine("Checkpoint already up to date at " + lastAppliedZnode);
+            }
         } catch (KeeperException.NoNodeException nne) {
-            log.log(Level.INFO, "No /requests znode yet; nothing to replay");
+            log.log(Level.INFO, "No /requests znode yet; nothing to replay/checkpoint");
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Error replaying pending ZK requests", e);
+            log.log(Level.SEVERE, "Error updating checkpoint from ZK log", e);
         }
     }
 
@@ -214,26 +209,15 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
     @Override
     protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
         String request = new String(bytes, StandardCharsets.UTF_8);
-
         try {
-            String fullPath = zk.create(
+            zk.create(
                     REQUESTS_PATH + "/req_",
                     request.getBytes(StandardCharsets.UTF_8),
                     ZooDefs.Ids.OPEN_ACL_UNSAFE,
                     CreateMode.PERSISTENT_SEQUENTIAL
             );
-            String nodeName = fullPath.substring(fullPath.lastIndexOf('/') + 1);
 
-            try {
-                session.execute(request);
-            } catch (Exception e) {
-                log.log(Level.SEVERE, "Error executing client request locally: " + request, e);
-            }
-
-            synchronized (this) {
-                lastAppliedZnode = nodeName;
-                persistCheckpoint();
-            }
+            replayPendingRequests();
 
             try {
                 clientMessenger.send(header.sndr, "OK".getBytes(StandardCharsets.UTF_8));
