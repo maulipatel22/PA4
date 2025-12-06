@@ -1,167 +1,173 @@
 package server.faulttolerance;
 
-import com.datastax.driver.core.*;
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
 import edu.umass.cs.gigapaxos.interfaces.Replicable;
 import edu.umass.cs.gigapaxos.interfaces.Request;
 import edu.umass.cs.gigapaxos.paxospackets.RequestPacket;
 import edu.umass.cs.nio.interfaces.IntegerPacketType;
 import edu.umass.cs.reconfiguration.reconfigurationutils.RequestParseException;
-import edu.umass.cs.utils.Util;
 
-import java.io.*;
-import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
-import java.util.*;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 
 public class MyDBReplicableAppGP implements Replicable {
 
-    public static final int SLEEP = 100; // used by tests
+    public static final int SLEEP = 1000;
+
     private final Cluster cluster;
     private final Session session;
     private final String keyspace;
-
-    private static final int MAX_LOG_SIZE = 400;
-    private final Queue<String> requestLog = new ConcurrentLinkedQueue<>();
-    private final File checkpointFile;
+    private static final String TABLE = "kv"; 
 
     public MyDBReplicableAppGP(String[] args) throws IOException {
-        if (args == null || args.length < 1)
-            throw new IllegalArgumentException("Must provide keyspace name as args[0]");
+        if (args == null || args.length == 0 || args[0] == null) {
+            throw new IllegalArgumentException(
+                    "MyDBReplicableAppGP requires args[0] = keyspace");
+        }
 
         this.keyspace = args[0];
-        this.checkpointFile = new File(keyspace + "_checkpoint.dat");
 
-        InetSocketAddress isaDB = args.length > 1 ?
-                Util.getInetSocketAddressFromString(args[1]) :
-                new InetSocketAddress("localhost", 9042);
+        String cassandraHost = (args.length > 1 && args[1] != null)
+                ? args[1]
+                : "127.0.0.1";
+        int cassandraPort = 9042;
+        if (args.length > 2 && args[2] != null) {
+            cassandraPort = Integer.parseInt(args[2]);
+        }
 
-        cluster = Cluster.builder()
-                .addContactPoint(isaDB.getHostString())
-                .withPort(isaDB.getPort())
-                .build();
-        session = cluster.connect();
+        try {
+            this.cluster = Cluster.builder()
+                    .addContactPoint(cassandraHost)
+                    .withPort(cassandraPort)
+                    .build();
+            this.session = this.cluster.connect();
 
-        session.execute("CREATE KEYSPACE IF NOT EXISTS " + keyspace +
-                " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};");
-        session.execute("USE " + keyspace + ";");
+            initSchema();
+        } catch (Exception e) {
+            throw new IOException("Error initializing Cassandra", e);
+        }
+    }
 
-        restoreCheckpoint();
+    private void initSchema() {
+        String ksCql = "CREATE KEYSPACE IF NOT EXISTS " + keyspace + " WITH " +
+                "replication = {'class':'SimpleStrategy','replication_factor':1}";
+        session.execute(ksCql);
+
+        session.execute("USE " + keyspace);
+
+        String tableCql =
+                "CREATE TABLE IF NOT EXISTS " + TABLE + " (" +
+                        "k text PRIMARY KEY, " +
+                        "v int" +
+                        ")";
+        session.execute(tableCql);
+    }
+
+ 
+    @Override
+    public boolean execute(Request request, boolean doNotReplyToClient) {
+        return execute(request);
     }
 
     @Override
     public boolean execute(Request request) {
-        return execute(request, false);
-    }
-
-    @Override
-    public boolean execute(Request request, boolean b) {
-        if (!(request instanceof RequestPacket))
-            throw new IllegalArgumentException("Expected RequestPacket");
+        if (!(request instanceof RequestPacket)) {
+            return false;
+        }
 
         RequestPacket rp = (RequestPacket) request;
-        String command = rp.getRequestValue() != null
-                ? rp.getRequestValue().trim()
-                : "";
 
-        String lower = command.toLowerCase();
-        if (!(lower.startsWith("insert") || lower.startsWith("update") ||
-                lower.startsWith("delete") || lower.startsWith("create") ||
-                lower.startsWith("drop")   || lower.startsWith("use") ||
-                lower.startsWith("select"))) {
-            return true;
+        String reqString = rp.getRequestValue(); // if this doesn’t compile, use rp.toString() and adjust
+
+        handleRequestString(reqString);
+
+        return true;
+    }
+
+    private void handleRequestString(String req) {
+        if (req == null) {
+            return;
         }
 
+        String trimmed = req.trim();
+        if (trimmed.isEmpty()) {
+            return;
+        }
+
+        String[] parts = trimmed.split("\\s+");
+        String op = parts[0].toUpperCase();
+
         try {
-            session.execute(command);
-            requestLog.add(command);
-
-            if (requestLog.size() >= MAX_LOG_SIZE) {
-                checkpointState();
-                requestLog.clear();
+            switch (op) {
+                case "PUT": {
+                    if (parts.length != 3) return;
+                    String key = parts[1];
+                    int value = Integer.parseInt(parts[2]);
+                    session.execute("INSERT INTO " + TABLE + " (k, v) VALUES (?, ?)",
+                            key, value);
+                    break;
+                }
+                case "GET": {
+                    if (parts.length != 2) return;
+                    String key = parts[1];
+                    ResultSet rs = session.execute(
+                            "SELECT v FROM " + TABLE + " WHERE k = ?", key);
+                    Row row = rs.one();
+                    int value = (row != null) ? row.getInt("v") : 0;
+                    break;
+                }
+                case "ADD": {
+                    if (parts.length != 3) return;
+                    String key = parts[1];
+                    int delta = Integer.parseInt(parts[2]);
+                    ResultSet rs = session.execute(
+                            "SELECT v FROM " + TABLE + " WHERE k = ?", key);
+                    Row row = rs.one();
+                    int oldVal = (row != null) ? row.getInt("v") : 0;
+                    int newVal = oldVal + delta;
+                    session.execute("INSERT INTO " + TABLE + " (k, v) VALUES (?, ?)",
+                            key, newVal);
+                    break;
+                }
+                default:
+                    break;
             }
-
-            Thread.sleep(SLEEP);
-            return true;
         } catch (Exception e) {
             e.printStackTrace();
-            return false;
         }
     }
-        @Override
-        public Request getRequest(String s) throws RequestParseException {
-            try {
-                return new RequestPacket(s.getBytes("UTF-8"));
-            } catch (Exception e) {
-                throw new RequestParseException(e);
-            }
-        }
-
-
     @Override
-    public String checkpoint(String s) {
-        try {
-            checkpointState();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        return checkpointFile.getAbsolutePath();
+    public String checkpoint(String name) {
+        return "";
     }
 
     @Override
-    public boolean restore(String filePath, String s1) {
-        try {
-            restoreCheckpoint();
-            return true;
-        } catch (IOException e) {
-            e.printStackTrace();
-            return false;
-        }
+    public boolean restore(String name, String state) {
+        return true;
+    }
+
+    @Override
+    public Request getRequest(String s) throws RequestParseException {
+        return null;
     }
 
     @Override
     public Set<IntegerPacketType> getRequestTypes() {
-        return new HashSet<>();
+        return Collections.unmodifiableSet(new HashSet<IntegerPacketType>());
     }
 
-    public void close() {
-        if (session != null) session.close();
-        if (cluster != null) cluster.close();
-    }
-
-    private void checkpointState() throws IOException {
-        try (ObjectOutputStream oos = new ObjectOutputStream(
-                new FileOutputStream(checkpointFile))) {
-
-            List<String> logCopy = new ArrayList<>(requestLog);
-            oos.writeObject(logCopy);
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private void restoreCheckpoint() throws IOException {
-        if (!checkpointFile.exists()) return;
-
-        try (ObjectInputStream ois = new ObjectInputStream(
-                new FileInputStream(checkpointFile))) {
-
-            Object obj = ois.readObject();
-            if (!(obj instanceof List)) {
-                throw new IOException("Invalid checkpoint format");
-            }
-
-            List<String> savedLog = (List<String>) obj;
-            for (String cmd : savedLog) {
-                try {
-                    session.execute(cmd);
-                    requestLog.add(cmd);
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
-
-        } catch (ClassNotFoundException e) {
-            throw new IOException(e);
+    @Override
+    protected void finalize() throws Throwable {
+        try {
+            if (session != null) session.close();
+            if (cluster != null) cluster.close();
+        } finally {
+            super.finalize();
         }
     }
 }
