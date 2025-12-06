@@ -59,7 +59,14 @@ public class MyDBReplicableAppGP implements Replicable {
             throw new IllegalArgumentException("Expected RequestPacket");
 
         RequestPacket rp = (RequestPacket) request;
-        String command = rp.toString();  // <-- fixed
+        String command;
+        if (rp.requestValue != null) {
+            command = rp.requestValue instanceof byte[]
+                    ? new String((byte[]) rp.requestValue, StandardCharsets.UTF_8)
+                    : rp.requestValue.toString();
+        } else {
+            command = "";
+        }
 
         try {
             session.execute(command);
