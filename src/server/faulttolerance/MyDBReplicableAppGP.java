@@ -53,6 +53,7 @@ public class MyDBReplicableAppGP implements Replicable {
     public boolean execute(Request request) {
         return execute(request, false);
     }
+
     @Override
     public boolean execute(Request request, boolean b) {
         if (!(request instanceof RequestPacket))
@@ -60,16 +61,16 @@ public class MyDBReplicableAppGP implements Replicable {
 
         RequestPacket rp = (RequestPacket) request;
         String command = rp.getRequestValue() != null
-                ? new String(rp.getRequestValue(), StandardCharsets.UTF_8).trim()
+                ? rp.getRequestValue().trim()
                 : "";
+
         String lower = command.toLowerCase();
         if (!(lower.startsWith("insert") || lower.startsWith("update") ||
-            lower.startsWith("delete") || lower.startsWith("create") ||
-            lower.startsWith("drop")   || lower.startsWith("use") ||
-            lower.startsWith("select"))) {
+                lower.startsWith("delete") || lower.startsWith("create") ||
+                lower.startsWith("drop")   || lower.startsWith("use") ||
+                lower.startsWith("select"))) {
             return true;
         }
-
 
         try {
             session.execute(command);
@@ -93,7 +94,6 @@ public class MyDBReplicableAppGP implements Replicable {
         return new RequestPacket(s.getBytes(StandardCharsets.UTF_8));
     }
 
-
     @Override
     public String checkpoint(String s) {
         try {
@@ -114,7 +114,6 @@ public class MyDBReplicableAppGP implements Replicable {
             return false;
         }
     }
-
 
     @Override
     public Set<IntegerPacketType> getRequestTypes() {
