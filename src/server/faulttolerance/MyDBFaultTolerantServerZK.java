@@ -18,14 +18,13 @@ import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+
 public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
 
     private static final Logger log = Logger.getLogger(MyDBFaultTolerantServerZK.class.getName());
 
     public static final int MAX_LOG_SIZE = 400;
     public static final int DEFAULT_PORT = 2181;
-    public static final int SLEEP = 1000;
-    public static final boolean DROP_TABLES_AFTER_TESTS = true;
 
     private final String myID;
     private final NodeConfig<String> nodeConfig;
@@ -37,12 +36,14 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
     private Cluster cluster;
     private com.datastax.driver.core.Session session;
+
+    // ✅ Correct constructor with throws IOException
     public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID,
-                                    InetSocketAddress isaDB) {
+                                     InetSocketAddress isaDB) throws IOException {
         super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
                                     nodeConfig.getNodePort(myID)),
-            isaDB,
-            myID); // call superclass constructor
+              isaDB,
+              myID); // call superclass constructor
 
         this.myID = myID;
         this.nodeConfig = nodeConfig;
@@ -53,22 +54,11 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
             ensureZNodeExists(REQUESTS_PATH);
             recoverFromCheckpoint();
             replayPendingRequests();
-        } catch (IOException | KeeperException | InterruptedException e) {
+        } catch (KeeperException | InterruptedException e) {
             e.printStackTrace();
             throw new RuntimeException(e); // wrap checked exceptions
         }
     }
-
-
-private static void superWrapper(NodeConfig<String> nodeConfig, String myID, InetSocketAddress isaDB) {
-    try {
-        new MyDBSingleServer(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
-                nodeConfig.getNodePort(myID)), isaDB, myID);
-    } catch (IOException e) {
-        throw new RuntimeException(e);
-    }
-}
-
 
     private void connectToCassandra(InetSocketAddress isaDB) {
         cluster = Cluster.builder()
