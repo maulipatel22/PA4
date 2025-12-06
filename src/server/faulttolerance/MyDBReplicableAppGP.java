@@ -58,7 +58,7 @@ public class MyDBReplicableAppGP implements Replicable {
 
         RequestPacket rp = (RequestPacket) request;
 
-        String command = new String(rp.getBytes(), StandardCharsets.UTF_8);
+        String command = rp.toString();
 
         try {
             session.execute(command);
@@ -68,6 +68,7 @@ public class MyDBReplicableAppGP implements Replicable {
             return false;
         }
     }
+
 
     @Override
     public String checkpoint(String s) {
