@@ -37,10 +37,13 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
     private Cluster cluster;
     private com.datastax.driver.core.Session session;
-
     public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID,
                                     InetSocketAddress isaDB) {
-        superWrapper(nodeConfig, myID, isaDB); // call wrapper
+        super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
+                                    nodeConfig.getNodePort(myID)),
+            isaDB,
+            myID); // call superclass constructor
+
         this.myID = myID;
         this.nodeConfig = nodeConfig;
 
@@ -56,7 +59,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
         }
     }
 
-// wrapper method to handle IOException from super(...)
+
 private static void superWrapper(NodeConfig<String> nodeConfig, String myID, InetSocketAddress isaDB) {
     try {
         new MyDBSingleServer(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
