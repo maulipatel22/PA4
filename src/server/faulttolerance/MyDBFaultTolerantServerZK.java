@@ -25,7 +25,9 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
     public static final int MAX_LOG_SIZE = 400;
     public static final int DEFAULT_PORT = 2181;
-
+    public static final int SLEEP = 1000;  
+    public static final boolean DROP_TABLES_AFTER_TESTS = true;  
+    
     private final String myID;
     private final NodeConfig<String> nodeConfig;
     private ZooKeeper zk;
