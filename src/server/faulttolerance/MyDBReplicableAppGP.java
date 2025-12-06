@@ -15,10 +15,7 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.Set;
 
-/**
- * GigaPaxos-based fault-tolerant database application using Cassandra.
- * Implements bounded log checkpointing (Option A).
- */
+
 public class MyDBReplicableAppGP implements Replicable {
 
     public static final int SLEEP = 1000;
@@ -28,7 +25,6 @@ public class MyDBReplicableAppGP implements Replicable {
     private Session session;
     private String keyspace;
 
-    // Bounded log of executed requests for checkpointing
     private final Deque<String> executedRequests = new ArrayDeque<>();
 
     /**
@@ -43,34 +39,25 @@ public class MyDBReplicableAppGP implements Replicable {
 
         this.keyspace = args[0];
 
-        // Connect to Cassandra on localhost default port
         cluster = Cluster.builder().addContactPoint("127.0.0.1").build();
         session = cluster.connect();
 
-        // Ensure keyspace exists
         session.execute("CREATE KEYSPACE IF NOT EXISTS " + keyspace +
                 " WITH replication = {'class': 'SimpleStrategy', 'replication_factor':1};");
 
-        // Use keyspace
         session.execute("USE " + keyspace + ";");
 
-        // Ensure default table exists
         session.execute("CREATE TABLE IF NOT EXISTS default_table (" +
                 "key int PRIMARY KEY, " +
                 "value int);");
     }
 
-    /**
-     * Execute a GigaPaxos request (client-facing version).
-     */
+  
     @Override
     public boolean execute(Request request, boolean b) {
         return execute(request);
     }
 
-    /**
-     * Execute a GigaPaxos request.
-     */
     @Override
     public boolean execute(Request request) {
         if (!(request instanceof RequestPacket)) {
@@ -80,7 +67,6 @@ public class MyDBReplicableAppGP implements Replicable {
         RequestPacket rp = (RequestPacket) request;
         String command = rp.getCommand();
 
-        // Log the command for checkpointing
         synchronized (executedRequests) {
             if (executedRequests.size() >= MAX_LOG_SIZE) {
                 executedRequests.removeFirst();
@@ -88,7 +74,6 @@ public class MyDBReplicableAppGP implements Replicable {
             executedRequests.addLast(command);
         }
 
-        // Parse command: expecting "insert key value" or "update key value"
         String[] tokens = command.trim().split("\\s+");
         if (tokens.length < 2) {
             throw new IllegalArgumentException("Malformed command: " + command);
@@ -114,9 +99,7 @@ public class MyDBReplicableAppGP implements Replicable {
         return true;
     }
 
-    /**
-     * Checkpoint current executed requests into a string.
-     */
+
     @Override
     public String checkpoint(String s) {
         StringBuilder sb = new StringBuilder();
@@ -128,7 +111,7 @@ public class MyDBReplicableAppGP implements Replicable {
         return sb.toString();
     }
 
-    /**
+    
 
     @Override
     public boolean restore(String s, String s1) {
