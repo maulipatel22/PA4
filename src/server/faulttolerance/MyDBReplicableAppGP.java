@@ -5,7 +5,6 @@ import edu.umass.cs.gigapaxos.interfaces.Replicable;
 import edu.umass.cs.gigapaxos.interfaces.Request;
 import edu.umass.cs.gigapaxos.paxospackets.RequestPacket;
 import edu.umass.cs.nio.interfaces.IntegerPacketType;
-
 import java.io.IOException;
 import java.util.*;
 
@@ -67,10 +66,10 @@ public class MyDBReplicableAppGP implements Replicable {
     RequestPacket rp = (RequestPacket) request;
 
     String raw = rp.getRequestValue();
-    System.out.println(">>> RAW RECEIVED: " + raw);
+    System.out.println("---- Recevied: " + raw);
 
     String cql = extractCQL(raw);
-    System.out.println(">>> CQL EXTRACTED: " + cql);
+    System.out.println("---- Extracted: " + cql);
 
     if (cql == null || cql.trim().isEmpty()) {
         rp.setResponse("ERROR: empty CQL");
@@ -170,7 +169,7 @@ public class MyDBReplicableAppGP implements Replicable {
                 return true;
 
             String trimmed = state.trim();
-            trimmed = trimmed.substring(1, trimmed.length() - 1).trim();  // strip {}
+            trimmed = trimmed.substring(1, trimmed.length() - 1).trim(); 
             if (trimmed.isEmpty()) return true;
 
             String[] entries = trimmed.split("\\},\\{");

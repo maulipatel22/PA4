@@ -23,7 +23,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-
 public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
 
     private static final Logger log =
@@ -86,7 +85,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
             replayPendingRequests();
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Error initializing MyDBFaultTolerantServerZK for " + myID, e);
+            log.log(Level.SEVERE, "Error while initializing MyDBFaultTolerantServerZK for " + myID, e);
             throw new IOException(e);
         }
     }
@@ -95,7 +94,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
             ResultSet rs = session.execute("SELECT * FROM " + DATA_TABLE + " LIMIT 1;");
             return rs.one() == null;
         } catch (Exception e) {
-            log.warning("Error checking if grade table is empty for " + myID);
+            log.warning("Error: CHECK grade table is empty - " + myID);
             return true;
         }
     }
@@ -118,7 +117,7 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
                 replayPendingRequests();
             }
         } catch (Exception e) {
-            log.log(Level.SEVERE, "ZK watcher error on " + myID, e);
+            log.log(Level.SEVERE, "Watcher error on " + myID, e);
         }
     }
 
